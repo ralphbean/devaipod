@@ -1471,6 +1471,9 @@ struct PodSummaryResponse {
     completion_status: CompletionStatus,
     /// Human-readable session title.
     title: Option<String>,
+    /// Draft PRs created by the agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prs: Vec<PrEntry>,
 }
 
 /// Maximum number of output lines to return in the summary.
@@ -1491,6 +1494,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     };
+    let prs = read_prs().await;
 
     let unknown = PodSummaryResponse {
         activity: "Unknown".to_string(),
@@ -1501,6 +1505,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
         session_count: 0,
         completion_status: CompletionStatus::default(),
         title: title.clone(),
+        prs: prs.clone(),
     };
 
     let client = match reqwest::Client::builder()
@@ -1544,6 +1549,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
             session_count: 0,
             completion_status,
             title: title.clone(),
+            prs: prs.clone(),
         });
     }
 
@@ -1593,6 +1599,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
         session_count,
         completion_status,
         title,
+        prs,
     })
 }
 
@@ -2173,6 +2180,11 @@ fn title_path() -> PathBuf {
     state_dir().join("title.txt")
 }
 
+/// Resolve the PR list file path.
+fn prs_path() -> PathBuf {
+    state_dir().join("prs.json")
+}
+
 /// Read the current completion status from disk.
 async fn read_completion_status(workspace: &std::path::Path) -> CompletionStatus {
     let path = completion_status_path(workspace);
@@ -2411,6 +2423,85 @@ async fn update_title(
 }
 
 // ---------------------------------------------------------------------------
+// PR list endpoints
+// ---------------------------------------------------------------------------
+
+/// A single PR entry stored in the PR list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PrEntry {
+    url: String,
+    title: String,
+    created_at: i64,
+}
+
+/// Request body for `POST /prs`.
+#[derive(Debug, Deserialize)]
+struct PrCreateRequest {
+    url: String,
+    title: String,
+}
+
+/// Response for `GET /prs`.
+#[derive(Debug, Serialize)]
+struct PrListResponse {
+    prs: Vec<PrEntry>,
+}
+
+/// Read the PR list from disk. Returns an empty list if the file doesn't exist.
+async fn read_prs() -> Vec<PrEntry> {
+    let path = prs_path();
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => serde_json::from_str::<Vec<PrEntry>>(&content).unwrap_or_default(),
+        Err(_) => vec![],
+    }
+}
+
+/// `GET /prs` — list all PRs created by the agent.
+async fn get_prs() -> Json<PrListResponse> {
+    Json(PrListResponse { prs: read_prs().await })
+}
+
+/// `POST /prs` — record a new PR created by the agent.
+///
+/// Does NOT require admin token — like `PUT /title`, this is
+/// agent-callable metadata, not a security-sensitive setting.
+async fn create_pr(
+    Json(req): Json<PrCreateRequest>,
+) -> Result<Json<PrEntry>, StatusCode> {
+    let entry = PrEntry {
+        url: req.url,
+        title: req.title,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    };
+
+    let path = prs_path();
+    let temp_path = path.with_extension("json.tmp");
+
+    // Read existing list, append, write atomically.
+    let mut prs = read_prs().await;
+    prs.push(entry.clone());
+
+    let json = serde_json::to_string_pretty(&prs).map_err(|e| {
+        tracing::error!("Failed to serialize PR list: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    tokio::fs::write(&temp_path, &json).await.map_err(|e| {
+        tracing::error!("Failed to write PR list to {:?}: {}", temp_path, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    tokio::fs::rename(&temp_path, &path).await.map_err(|e| {
+        tracing::error!("Failed to rename {:?} -> {:?}: {}", temp_path, path, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    tracing::info!("Recorded PR: {} ({})", entry.title, entry.url);
+    Ok(Json(entry))
+}
+
+// ---------------------------------------------------------------------------
 // Server entrypoint
 // ---------------------------------------------------------------------------
 
@@ -2470,6 +2561,8 @@ fn build_router(state: AppState) -> Router {
         )
         // Session title
         .route("/title", get(get_title).put(update_title))
+        // PR list
+        .route("/prs", get(get_prs).post(create_pr))
         // PTY endpoints
         .route("/pty", get(pty_list).post(pty_create))
         .route(
@@ -3254,5 +3347,178 @@ mod tests {
                 .as_bool()
                 .unwrap()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR list endpoint tests
+    // -----------------------------------------------------------------------
+
+    /// Run a PR endpoint test with an isolated state dir.
+    ///
+    /// Sets `DEVAIPOD_STATE_DIR` to a unique temp directory for each test,
+    /// runs the provided async closure, then restores the env var.
+    /// Tests using this helper are serialized via `#[serial_test::serial]`
+    /// to avoid env var races.
+    async fn with_pr_state_dir<F, Fut>(f: F)
+    where
+        F: FnOnce(tempfile::TempDir) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("DEVAIPOD_STATE_DIR", tmp.path());
+        f(tmp).await;
+        std::env::remove_var("DEVAIPOD_STATE_DIR");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_prs_get_empty() {
+        with_pr_state_dir(|tmp| async move {
+            let app = test_app(tmp.path());
+
+            let req = HttpRequest::builder()
+                .uri("/prs")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["prs"], serde_json::json!([]));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_prs_post_and_get() {
+        with_pr_state_dir(|tmp| async move {
+            let app = test_app(tmp.path());
+
+            // POST a PR
+            let req = HttpRequest::builder()
+                .method("POST")
+                .uri("/prs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "url": "https://github.com/org/repo/pull/42",
+                        "title": "Fix the thing"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap();
+
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["url"], "https://github.com/org/repo/pull/42");
+            assert_eq!(json["title"], "Fix the thing");
+            assert!(json["created_at"].is_i64());
+
+            // GET should return the PR in the list
+            let app = test_app(tmp.path());
+            let req = HttpRequest::builder()
+                .uri("/prs")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let prs = json["prs"].as_array().unwrap();
+            assert_eq!(prs.len(), 1);
+            assert_eq!(prs[0]["url"], "https://github.com/org/repo/pull/42");
+            assert_eq!(prs[0]["title"], "Fix the thing");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_prs_post_multiple() {
+        with_pr_state_dir(|tmp| async move {
+            // POST first PR
+            let app = test_app(tmp.path());
+            let req = HttpRequest::builder()
+                .method("POST")
+                .uri("/prs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "url": "https://github.com/org/repo/pull/1",
+                        "title": "First PR"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            // POST second PR
+            let app = test_app(tmp.path());
+            let req = HttpRequest::builder()
+                .method("POST")
+                .uri("/prs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "url": "https://github.com/org/repo/pull/2",
+                        "title": "Second PR"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            // GET should return both
+            let app = test_app(tmp.path());
+            let req = HttpRequest::builder()
+                .uri("/prs")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.oneshot(req).await.unwrap();
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let prs = json["prs"].as_array().unwrap();
+            assert_eq!(prs.len(), 2);
+            assert_eq!(prs[0]["title"], "First PR");
+            assert_eq!(prs[1]["title"], "Second PR");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_prs_post_no_auth_required() {
+        with_pr_state_dir(|tmp| async move {
+            let app = test_app(tmp.path());
+
+            // POST without any auth header should succeed
+            let req = HttpRequest::builder()
+                .method("POST")
+                .uri("/prs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "url": "https://github.com/org/repo/pull/99",
+                        "title": "No auth needed"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap();
+
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
+        .await;
     }
 }

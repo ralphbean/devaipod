@@ -64,6 +64,7 @@ tokio-stream = "0.1.18"
 [dev-dependencies]
 insta = "1"
 rstest = "0.24"
+serial_test = "3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

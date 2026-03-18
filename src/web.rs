@@ -2202,6 +2202,9 @@ struct AgentStatusResponse {
     /// Human-readable session title (from pod-api state).
     #[serde(default)]
     title: Option<String>,
+    /// Draft PRs created by the agent.
+    #[serde(default)]
+    prs: Vec<serde_json::Value>,
 }
 
 impl AgentStatusResponse {
@@ -2216,6 +2219,7 @@ impl AgentStatusResponse {
             session_count: 0,
             completion_status: None,
             title: None,
+            prs: vec![],
         }
     }
 }
